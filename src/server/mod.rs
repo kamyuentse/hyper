@@ -41,6 +41,26 @@ use proto::Body;
 pub use proto::response::Response;
 pub use proto::request::Request;
 
+// The `Server` can be created use its own `Core`, or an shared `Handle`.
+enum Reactor {
+    // Own its `Core`
+    Core(Core),
+    // Share `Handle` with others
+    Handle(Handle),
+}
+
+impl Reactor {
+    /// Returns a handle to the underlying event loop that this server will be
+    /// running on.
+    #[inline]
+    pub fn handle(&self) -> Handle {
+        match *self {
+            Reactor::Core(ref core) => core.handle(),
+            Reactor::Handle(ref handle) => handle.clone(),
+        }
+    }
+}
+
 /// An instance of the HTTP protocol, and implementation of tokio-proto's
 /// `ServerProto` trait.
 ///
@@ -63,7 +83,7 @@ where B: Stream<Error=::Error>,
 {
     protocol: Http<B::Item>,
     new_service: S,
-    core: Core,
+    reactor: Reactor,
     listener: TcpListener,
     shutdown_timeout: Duration,
 }
@@ -117,10 +137,34 @@ impl<B: AsRef<[u8]> + 'static> Http<B> {
 
         Ok(Server {
             new_service: new_service,
-            core: core,
+            reactor: Reactor::Core(core),
             listener: listener,
             protocol: self.clone(),
             shutdown_timeout: Duration::new(1, 0),
+        })
+    }
+
+    /// This method allows the ability to share a `Core` with multiple servers.
+    ///
+    /// Bind the provided `addr` and return a server with a shared `Core`.
+    ///
+    /// This is method will bind the `addr` provided with a new TCP listener ready
+    /// to accept connections. Each connection will be processed with the
+    /// `new_service` object provided as well, creating a new service per
+    /// connection.
+    pub fn bind_handle<S, Bd>(&self, addr: &SocketAddr, new_service: S, handle: &Handle) -> ::Result<Server<S, Bd>>
+        where S: NewService<Request = Request, Response = Response<Bd>, Error = ::Error> + 'static,
+              Bd: Stream<Item=B, Error=::Error>,
+    {
+        let listener = TcpListener::bind(addr, &handle)?;
+
+        Ok(Server {
+            new_service: new_service,
+            reactor: Reactor::Handle(handle.clone()),
+            listener: listener,
+            protocol: self.clone(),
+            shutdown_timeout: Duration::new(1, 0),
+
         })
     }
 
@@ -404,7 +448,7 @@ impl<S, B> Server<S, B>
     /// Returns a handle to the underlying event loop that this server will be
     /// running on.
     pub fn handle(&self) -> Handle {
-        self.core.handle()
+        self.reactor.handle()
     }
 
     /// Configure the amount of time this server will wait for a "graceful
@@ -444,7 +488,13 @@ impl<S, B> Server<S, B>
     pub fn run_until<F>(self, shutdown_signal: F) -> ::Result<()>
         where F: Future<Item = (), Error = ()>,
     {
-        let Server { protocol, new_service, mut core, listener, shutdown_timeout } = self;
+        let Server { protocol, new_service, reactor, listener, shutdown_timeout } = self;
+
+        let mut core = match reactor {
+            Reactor::Core(core) => core,
+            _ => panic!("Server does not own its core, use `Handle::spawn()` to run the service!"),
+        };
+
         let handle = core.handle();
 
         // Mini future to track the number of active services
@@ -492,6 +542,38 @@ impl<S, B> Server<S, B>
         match core.run(wait.select(timeout)) {
             Ok(_) => Ok(()),
             Err((e, _)) => Err(e.into())
+        }
+    }
+}
+
+impl<S, B> Future for Server<S, B>
+    where S: NewService<Request = Request, Response = Response<B>, Error = ::Error> + 'static,
+          B: Stream<Error=::Error> + 'static,
+          B::Item: AsRef<[u8]>,
+{
+    type Item = ();
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        if let Reactor::Core(_) = self.reactor {
+            panic!("Server owns its core, use `Server::run()` to run the service!")
+        }
+
+        loop {
+            match self.listener.accept() {
+                Ok((socket, addr)) => {
+                    // TODO: use the NotifyService
+                    match self.new_service.new_service() {
+                        Ok(srv) => self.protocol.bind_connection(&self.handle(),
+                                                                 socket,
+                                                                 addr,
+                                                                 srv),
+                        Err(e) => debug!("internal error: {:?}", e),
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Async::NotReady),
+                Err(e) => debug!("internal error: {:?}", e),
+            }
         }
     }
 }
