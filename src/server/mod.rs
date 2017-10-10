@@ -16,10 +16,9 @@ use std::net::SocketAddr;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
-use futures::future;
 use futures::task::{self, Task};
+use futures::future::{self, Select, Map};
 use futures::{Future, Stream, Poll, Async, Sink, StartSend, AsyncSink};
-use futures::future::Map;
 
 #[cfg(feature = "compat")]
 use http;
@@ -86,6 +85,17 @@ where B: Stream<Error=::Error>,
     reactor: Reactor,
     listener: TcpListener,
     shutdown_timeout: Duration,
+}
+
+/// The Future of an Server.
+pub struct ServerFuture<F, S, B>
+where B: Stream<Error=::Error>,
+      B::Item: AsRef<[u8]>,
+{
+    server: Server<S, B>,
+    info: Rc<RefCell<Info>>,
+    shutdown_signal: F,
+    shutdown: Option<Select<WaitUntilZero, Timeout>>,
 }
 
 impl<B: AsRef<[u8]> + 'static> Http<B> {
@@ -464,6 +474,21 @@ impl<S, B> Server<S, B>
         self
     }
 
+    /// Configure the `shutdown_signal`.
+    pub fn shutdown_signal<F>(self, signal: F) -> ServerFuture<F, S, B>
+        where F: Future<Item = (), Error = ()>
+    {
+        ServerFuture {
+            server: self,
+            info: Rc::new(RefCell::new(Info {
+                active: 0,
+                blocker: None,
+            })),
+            shutdown_signal: signal,
+            shutdown: None,
+        }
+    }
+
     /// Execute this server infinitely.
     ///
     /// This method does not currently return, but it will return an error if
@@ -578,15 +603,81 @@ impl<S, B> Future for Server<S, B>
     }
 }
 
+impl<F, S, B> Future for ServerFuture<F, S, B>
+    where F: Future<Item = (), Error = ()>,
+          S: NewService<Request = Request, Response = Response<B>, Error = ::Error> + 'static,
+          B: Stream<Error=::Error> + 'static,
+          B::Item: AsRef<[u8]>,
+{
+    type Item = ();
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            if let Some(ref mut shutdown) = self.shutdown {
+                match shutdown.poll() {
+                    Ok(Async::Ready(_)) => return Ok(Async::Ready(())),
+                    Ok(Async::NotReady) => return Ok(Async::NotReady),
+                    Err((e, _)) => debug!("internal error: {:?}", e),
+                }
+            } else if let Ok(Async::Ready(())) = self.shutdown_signal.poll() {
+                 match Timeout::new(self.server.shutdown_timeout, &self.server.handle()) {
+                    Ok(timeout) => {
+                        let wait = WaitUntilZero { info: self.info.clone() };
+                        self.shutdown = Some(wait.select(timeout))
+                    },
+                    Err(e) => debug!("internal error: {:?}", e),
+                }
+            } else {
+                match self.server.listener.accept() {
+                    Ok((socket, addr)) => {
+                        match self.server.new_service.new_service() {
+                            Ok(inner_srv) => {
+                                let srv = NotifyService {
+                                    inner: inner_srv,
+                                    info: Rc::downgrade(&self.info),
+                                };
+                                self.info.borrow_mut().active += 1;
+                                self.server.protocol.bind_connection(&self.server.handle(),
+                                                                     socket,
+                                                                     addr,
+                                                                     srv)
+                            },
+                            Err(e) => debug!("internal error: {:?}", e),
+                        }
+                    },
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Async::NotReady),
+                    Err(e) => debug!("internal error: {:?}", e),
+                }
+            }
+        }
+    }
+}
+
+
 impl<S: fmt::Debug, B: Stream<Error=::Error>> fmt::Debug for Server<S, B>
 where B::Item: AsRef<[u8]>
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Server")
-         .field("core", &"...")
+         .field("reactor", &"...")
          .field("listener", &self.listener)
          .field("new_service", &self.new_service)
          .field("protocol", &self.protocol)
+         .finish()
+    }
+}
+
+impl <F, S: fmt::Debug, B: Stream<Error=::Error>> fmt::Debug for ServerFuture<F, S, B>
+where B::Item: AsRef<[u8]>,
+F: Future<Item = (), Error = ()>
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("ServerFuture")
+         .field("server", &self.server)
+         .field("info", &"...")
+         .field("shutdown_signal", &"...")
+         .field("shutdown", &"...")
          .finish()
     }
 }

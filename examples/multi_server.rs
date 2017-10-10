@@ -76,7 +76,7 @@ fn main() {
     println!("Listening on http://{}", srv1.local_addr().unwrap());
     println!("Listening on http://{}", srv2.local_addr().unwrap());
 
-    handle.spawn(srv1);
-    handle.spawn(srv2);
+    handle.spawn(srv1.shutdown_signal(futures::future::empty::<(), ()>()));
+    handle.spawn(srv2.shutdown_signal(futures::future::empty::<(), ()>()));
     core.run(futures::future::empty::<(), ()>()).unwrap();
 }
